@@ -1,5 +1,4 @@
-#ifndef __T__MULTITHREADSVR__H__
-#define __T__MULTITHREADSVR__H__
+#pragma once
 
 #include "telement.h"
 
@@ -15,5 +14,3 @@ public:
 
 private:
 };
-
-#endif
