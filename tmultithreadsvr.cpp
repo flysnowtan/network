@@ -5,19 +5,32 @@
 #include "tepoller.h"
 #include "tqueue.h"
 #include "tepollhandler.h"
+#include "tepollsvrenum.h"
+#include "tepollctx.h"
+#include "tdatacache.h"
+
 #include <stdio.h>
 #include <vector>
 #include <errno.h>
+#include <syslog.h>
+#include <assert.h>
 
-//这些最好写到配置中
-#define LISTEN_PORT 9911
-#define IO_THREAD_NUM 8
-#define WORKER_NUM_PER_IO_THREAD 4
-#define EPOLL_WAIT_TIMEOUT 5
+
+//如果svr接受数据和发送数据达到堆满了缓冲区，此数据包会卡住，
+//客户端可以发一个极大的包，然后不read直接close，就能重现
+//所以这里需要一个定时清理过期fd的线程
+
+//加上超时处理之后
+//超时线程在查超时的包，会先判断时间timeval是否为0，不为0再判断是否超时[24;74H
+//这时候其他线程也有可能对这个时间初始化，这样会线程不安全，
+//比如说，超时线程A判断timeval不为0， 然后这时候B线程插入处理，
+//对timeval处理为0，之后A再去判断是否超时。
+//这时候就会超时，如果这时候被线程B清0后，此包又被其他请求使用，
+//之后对此包的判断都正常，则会误删其他的请求的数据。
 
 
 const bool bConnectionClose = false;
-const bool bIsNeedWorker = true;
+const bool bIsNeedWorker = false;
 
 
 using namespace std;
@@ -25,35 +38,83 @@ using namespace std;
 struct AcptThreadArg
 {
     vector<int> vecListenFd;
-    TEpoller ** ppEpoller;
+    TEpollCtx ** ppEpollCtx;
+    TDataCache * pDataCache;
 };
 
 struct MainThreadArg
 {
-    TEpoller * pEpoller;
-    TEpollHandler * pHandler;
+    TEpollCtx * pEpollCtx;
+    TDataCache * pDataCache;
 };
 
 struct IOThreadArg
 {
-    TEpoller * pEpoller;
+    TEpollCtx * pEpollCtx;
     TQueue * pQueue;
-    TEpollHandler * pHandler;
+    TDataCache * pDataCache;
 };
 
 struct WorkerThreadArg
 {
-    TEpoller * pEpoller;
+    TEpollCtx * pEpollCtx;
     TQueue *pQueue;
-    TEpollHandler * pHandler;
 };
+
+
+struct TimeOutThreadArg
+{
+    TEpollCtx ** ppEpollCtx;
+    TDataCache * pDataCache;
+};
+
 static bool bIsMainRunning =false;
+
+static void* RunWorkerThread(void* arg);
+static void* RunMainThread(void* arg);
+static void* RunIOThread(void* arg);
+static void* RunAcceptThread(void* arg);
+static void* RunTimeOutThread(void* arg);
+
+
+static void* RunTimeOutThread(void* arg)
+{
+    struct TimeOutThreadArg * pTimeOutArg = (struct TimeOutThreadArg *)arg;
+    TEpollCtx ** ppEpollCtx = pTimeOutArg->ppEpollCtx;
+    TDataCache * pDataCache = pTimeOutArg->pDataCache;
+
+    TElement * pElm = NULL;
+    TEpollCtx * pEpollCtx = NULL;
+    while(bIsMainRunning)
+    {
+        pElm = pDataCache->GetTimeOutElm(TIME_OUT * 1000);
+        if(pElm)
+        {
+            //may core here idx < 0
+            if(pElm->GetIOThreadIdx() >= 0)
+            {
+                pEpollCtx = ppEpollCtx[pElm->GetIOThreadIdx()];
+                printf("ctx %x elm %x idx %d fd %d\n", pEpollCtx, pElm, pElm->GetIOThreadIdx(), *(pElm->GetListenFd()));
+                if(!pEpollCtx->HasTimeOutElm())
+                {
+                    pEpollCtx->SetTimeOutElm(pElm);
+                }
+            }
+        }
+
+        if(!bIsMainRunning) break;
+
+        usleep(200000);
+    }
+
+    delete pTimeOutArg;
+    return NULL;
+}
 
 static void* RunWorkerThread(void* arg)
 {
     struct WorkerThreadArg * workerArg = (struct WorkerThreadArg *)arg;
-    TEpoller * pEpoller = workerArg->pEpoller;
-    TEpollHandler * pHandler = workerArg->pHandler;
+    TEpollCtx * pEpollCtx = workerArg->pEpollCtx;
     TQueue * pQueue = workerArg->pQueue;
 
     int iFd = -1;
@@ -62,10 +123,20 @@ static void* RunWorkerThread(void* arg)
     {
         if(pElm->IsProcessing())
         {
-            iFd = *(pElm->GetListenFd());
-            pHandler->DoWork();
-            if(pEpoller->ModifyFd(iFd, EPOLLOUT | EPOLLHUP | EPOLLERR | EPOLLET, pElm) != 0)
+            if(pElm->IsInQueueTimeOut())
             {
+                printf("inqueue timeout, ignore the pkg, %s->%d",
+                        __func__, __LINE__);
+            }
+            else
+            {
+                pEpollCtx->GetHandler()->DoWork(pElm);
+            }
+
+            iFd = *(pElm->GetListenFd());
+            if(pEpollCtx->GetEpoller()->ModifyFd(iFd, EPOLLOUT | EPOLLHUP | EPOLLERR | EPOLLET, pElm) != 0)
+            {
+                printf("ModifyFd err! %s->%d, iFd %d", __func__, __LINE__, iFd);
                 pElm->UnSetProcessing();
             }
         }
@@ -79,8 +150,10 @@ static void* RunWorkerThread(void* arg)
 static void* RunMainThread(void* arg)
 {
     struct MainThreadArg *mainArg = (struct MainThreadArg *)arg;
-    TEpoller * pEpoller = mainArg->pEpoller;
-    TEpollHandler * pHandler = mainArg->pHandler;
+    TEpollCtx * pEpollCtx = mainArg->pEpollCtx;
+    TEpoller * pEpoller = pEpollCtx->GetEpoller();
+    TEpollHandler * pHandler = pEpollCtx->GetHandler();
+    TDataCache * pDataCache = mainArg->pDataCache;
 
     while(bIsMainRunning)
     {
@@ -93,7 +166,7 @@ static void* RunMainThread(void* arg)
             struct epoll_event *event = pEpoller->GetEvent(i);
             TElement * pElm = (TElement *)event->data.ptr;
             iFd = *(pElm->GetListenFd());
-            void * pUserData = pElm->GetData();
+            pElm->SetNowTime();
 
             if(event->events & EPOLLIN)
             {
@@ -102,28 +175,32 @@ static void* RunMainThread(void* arg)
                 {
                     if(pEpoller->ModifyFd(iFd, EPOLLOUT | EPOLLHUP | EPOLLERR | EPOLLET, pElm) != 0)
                     {
+                        printf("ModifyFd err! %s->%d", __func__, __LINE__);
                         pEpoller->DelFd(iFd);
                         close(iFd);
-                        delete pElm;
-                        pElm = NULL;
+                        pDataCache->Free(pElm);
                     }
                 }
                 else if(iRet > 0)
                 {
                     if(pEpoller->ModifyFd(iFd, EPOLLIN | EPOLLHUP | EPOLLERR | EPOLLET, pElm) != 0)
                     {
+                        printf("ModifyFd err! %s->%d", __func__, __LINE__);
                         pEpoller->DelFd(iFd);
                         close(iFd);
-                        delete pElm;
-                        pElm = NULL;
+                        pDataCache->Free(pElm);
                     }
                 }
                 else
                 {
+                    if(iRet != -1002)
+                    {
+                        printf("HandleRecvData err! %s->%d iRet %d", __func__, __LINE__, iRet);
+                    }
+
                     pEpoller->DelFd(iFd);
                     close(iFd);
-                    delete pElm;
-                    pElm = NULL;
+                    pDataCache->Free(pElm);
                 }
             }
             else if(event->events & EPOLLOUT)
@@ -135,36 +212,52 @@ static void* RunMainThread(void* arg)
                     {
                         pEpoller->DelFd(iFd);
                         close(iFd);
-                        delete pElm;
-                        pElm = NULL;
-
+                        pDataCache->Free(pElm);
                     }
                     else
                     {
+                        pElm->ClearReqPkg();
                         if(pEpoller->ModifyFd(iFd, EPOLLIN | EPOLLHUP | EPOLLERR | EPOLLET, pElm) != 0)
                         {
+                            printf("ModifyFd err! %s->%d", __func__, __LINE__);
                             pEpoller->DelFd(iFd);
                             close(iFd);
-                            delete pElm;
-                            pElm = NULL;
+                            pDataCache->Free(pElm);
                         }
                     }
                 }
                 else if(iRet < 0)
                 {
+                    printf("HandleSendData err! %s->%d", __func__, __LINE__);
                     pEpoller->DelFd(iFd);
                     close(iFd);
-                    delete pElm;
-                    pElm = NULL;
+                    pDataCache->Free(pElm);
                 }
             }
             else
             {
+                printf("ERR event! %s->%d", __func__, __LINE__);
                 pEpoller->DelFd(iFd);
                 close(iFd);
-                delete pElm;
-                pElm = NULL;
+                pDataCache->Free(pElm);
             }
+        }
+
+        if(!bIsMainRunning) break;
+
+        TElement * pData = pEpollCtx->GetTimeOutElm();
+
+        if(pData)
+        {
+            iFd = *(pData->GetListenFd());
+
+            if(pData->IsUsed() && iFd > 0 && pData->GetIOThreadIdx() == pEpollCtx->GetIOThreadIdx())
+            {
+                pEpoller->DelFd(iFd);
+                close(iFd);
+                pDataCache->Free(pData);
+            }
+            pEpollCtx->DelTimeOutElm();
         }
     }
 
@@ -177,9 +270,11 @@ static void* RunMainThread(void* arg)
 static void* RunIOThread(void* arg)
 {
     struct IOThreadArg *ioArg = (struct IOThreadArg *)arg;
-    TEpoller *pEpoller = ioArg->pEpoller;
+    TEpollCtx * pEpollCtx = ioArg->pEpollCtx;
+    TEpoller *pEpoller =pEpollCtx->GetEpoller();
     TQueue * pQueue = ioArg->pQueue;
-    TEpollHandler *pHandler = ioArg->pHandler;
+    TEpollHandler *pHandler = pEpollCtx->GetHandler();
+    TDataCache * pDataCache = ioArg->pDataCache;
 
     while(bIsMainRunning)
     {
@@ -191,44 +286,51 @@ static void* RunIOThread(void* arg)
             struct epoll_event *event = pEpoller->GetEvent(i);
             TElement * pElm = (TElement *)event->data.ptr;
             iFd = *(pElm->GetListenFd());
-            void * pUserData = pElm->GetData();
+            pElm->SetNowTime();
 
             if(event->events & EPOLLIN)
             {
+                //worker正在处理
                 if(pElm->IsProcessing())    continue;
                 iRet = pHandler->HandleRecvData(pElm);
                 if(iRet == 0)
                 {
                     pElm->SetProcessing();
+                    pElm->SetInQueueTime();
                     if(!pQueue->Push(pElm))
                     {
                         //队列满了就删掉有数据的fd，保护一下
+                        printf("Push err! %s->%d", __func__, __LINE__);
                         pEpoller->DelFd(iFd);
                         close(iFd);
-                        delete pElm;
-                        pElm = NULL;
+                        pDataCache->Free(pElm);
                     }
                 }
                 else if(iRet > 0)
                 {
                     if(pEpoller->ModifyFd(iFd, EPOLLIN | EPOLLHUP | EPOLLERR | EPOLLET, pElm) != 0)
                     {
+                        printf("ModifyFd err! %s->%d", __func__, __LINE__);
                         pEpoller->DelFd(iFd);
                         close(iFd);
-                        delete pElm;
-                        pElm = NULL;
+                        pDataCache->Free(pElm);
                     }
                 }
                 else
                 {
+                    if(iRet != -1002)
+                    {
+                        printf("HandleRecvData err! %s->%d, iRet %d", __func__, __LINE__, iRet);
+                    }
+
                     pEpoller->DelFd(iFd);
                     close(iFd);
-                    delete pElm;
-                    pElm = NULL;
+                    pDataCache->Free(pElm);
                 }
             }
             else if(event->events & EPOLLOUT)
             {
+                pElm->UnSetProcessing();
                 iRet = pHandler->HandleSendData(pElm);
                 if(iRet == 0)
                 {
@@ -236,39 +338,57 @@ static void* RunIOThread(void* arg)
                     {
                         pEpoller->DelFd(iFd);
                         close(iFd);
-                        delete pElm;
-                        pElm = NULL;
+                        pDataCache->Free(pElm);
 
                     }
                     else
                     {
+                        pElm->ClearReqPkg();
                         if(pEpoller->ModifyFd(iFd, EPOLLIN | EPOLLHUP | EPOLLERR | EPOLLET, pElm) != 0)
                         {
+                            printf("ModifyFd err! %s->%d", __func__, __LINE__);
                             pEpoller->DelFd(iFd);
                             close(iFd);
-                            delete pElm;
-                            pElm = NULL;
+                            pDataCache->Free(pElm);
                         }
                     }
                 }
                 else if(iRet < 0)
                 {
+                    printf("HandleSendData err! %s->%d iRet %d", __func__, __LINE__, iRet);
                     pEpoller->DelFd(iFd);
                     close(iFd);
-                    delete pElm;
-                    pElm = NULL;
+                    pDataCache->Free(pElm);
                 }
             }
             else
             {
+                //worker可能正在处理
                 if(!pElm->IsProcessing())
                 {
+                    printf("ERR event! %s->%d", __func__, __LINE__);
                     pEpoller->DelFd(iFd);
                     close(iFd);
-                    delete pElm;
-                    pElm = NULL;
+                    pDataCache->Free(pElm);
                 }
             }
+        }
+
+        TElement * pData = pEpollCtx->GetTimeOutElm();
+
+        if(!bIsMainRunning) break;
+
+        if(pData)
+        {
+            iFd = *(pData->GetListenFd());
+
+            if(pData->IsUsed() && iFd > 0 && pData->GetIOThreadIdx() == pEpollCtx->GetIOThreadIdx())
+            {
+                pEpoller->DelFd(iFd);
+                close(iFd);
+                pDataCache->Free(pData);
+            }
+            pEpollCtx->DelTimeOutElm();
         }
     }
 
@@ -284,7 +404,8 @@ static void* RunAcceptThread(void* arg)
     AcptThreadArg *pAcptArg = (AcptThreadArg *)arg;
     auto_ptr<AcptThreadArg> ptrAcpt(pAcptArg);
 
-    TEpoller ** ppEpoller = pAcptArg->ppEpoller;
+    TEpollCtx ** ppEpollCtx = pAcptArg->ppEpollCtx;
+    TDataCache * pDataCache = pAcptArg->pDataCache;
 
     int iIOThreadIdx = 0;
     TEpoller *epoller = new TEpoller;
@@ -305,15 +426,19 @@ static void* RunAcceptThread(void* arg)
             printf("SetNonBlock error!\n");
             return NULL;
         }
-        printf("listen fd :%d\n", iFd);
 
-        //进程结束自动释放
-        TElement * pElm = new TElement;
+        TElement * pElm = pDataCache->Alloc();
+        if(pElm == NULL)
+        {
+            printf("data cache alloc err!\n");
+            return NULL;
+        }
         *(pElm->GetListenFd()) = iFd;
+        pElm->ClearTime();  // no timeout
 
         if(epoller->AddFd(iFd, EPOLLIN | EPOLLHUP | EPOLLERR, pElm) != 0)
         {
-            delete pElm;
+            pDataCache->Free(pElm);
             pElm = NULL;
             printf("listen AddFd error!\n");
             return NULL;
@@ -326,10 +451,6 @@ static void* RunAcceptThread(void* arg)
     while(bIsMainRunning)
     {
         int iEvents = epoller->Wait(EPOLL_WAIT_TIMEOUT);
-        if(iEvents > 0)
-        {
-            printf("new connect socket events %d\n", iEvents);
-        }
         for(int i = 0; i < iEvents; ++i)
         {
             struct epoll_event * event = epoller->GetEvent(i);
@@ -346,7 +467,7 @@ static void* RunAcceptThread(void* arg)
                 }
                 continue;
             }
-
+            
             if(TEpollUtils::SetNonBlock(iFd) != 0)
             {
                 printf("SetNonBlock error!\n");
@@ -355,13 +476,22 @@ static void* RunAcceptThread(void* arg)
             }
 
             //由IO线程释放
-            TElement * pEle = new TElement;
-            *(pEle->GetListenFd()) = iFd;
+            TElement * pElm = pDataCache->Alloc();
+            if(pElm == NULL)
+            {
+                printf("data cache alloc err!\n");
+                close(iFd);
+                continue;
+            }
 
-            if(ppEpoller[iIOThreadIdx]->AddFd(iFd, EPOLLIN | EPOLLHUP | EPOLLERR | EPOLLET, pEle) != 0)
+            *(pElm->GetListenFd()) = iFd;
+            pElm->SetNowTime();
+            pElm->SetIOThreadIdx(iIOThreadIdx);
+
+            if(ppEpollCtx[iIOThreadIdx]->GetEpoller()->AddFd(iFd, EPOLLIN | EPOLLHUP | EPOLLERR | EPOLLET, pElm) != 0)
             {
                 printf("accept AddFd error!\n");
-                delete pEle;
+                pDataCache->Free(pElm);
                 close(iFd);
                 continue;
             }
@@ -381,11 +511,13 @@ static void* RunAcceptThread(void* arg)
 
 TEpollSvr::TEpollSvr()
 {
+    openlog("testsvr", LOG_PID, LOG_USER);
     bIsMainRunning = false;
 }
 
 TEpollSvr::~TEpollSvr()
 {
+    closelog();
 }
 
 int TEpollSvr::Run()
@@ -397,18 +529,18 @@ int TEpollSvr::Run()
 
     TEpollUtils::ForkAsDaemon();
 
-    TEpoller ** ppEpoller = new TEpoller*[IO_THREAD_NUM];
+    TDataCache * pDataCache = new TDataCache;
+    assert(pDataCache != NULL);
+
+    TEpollCtx ** ppEpollCtx = new TEpollCtx*[IO_THREAD_NUM];
+    assert(ppEpollCtx != NULL);
+
     for(int i = 0; i < IO_THREAD_NUM; i++)
     {
-        ppEpoller[i] = new TEpoller;
-        if(ppEpoller[i]->Create() != 0)
-        {
-            printf("Create error!\n");
-            return -1;
-        }
+        ppEpollCtx[i] = new TEpollCtx;
+        assert(ppEpollCtx[i] != NULL);
+        ppEpollCtx[i]->SetIOThreadIdx(i);
     }
-
-    TEpollHandler * pHandler = new TEpollHandler;
 
     //launch io thread
     if(bIsNeedWorker)
@@ -418,7 +550,8 @@ int TEpollSvr::Run()
         {
             //io thread release
             IOThreadArg *arg = new IOThreadArg;
-            arg->pEpoller = ppEpoller[i];
+            arg->pEpollCtx = ppEpollCtx[i];
+            arg->pDataCache = pDataCache;
             if(WORKER_NUM_PER_IO_THREAD == 1)
             {
                 arg->pQueue = new TRingQueue;
@@ -428,7 +561,6 @@ int TEpollSvr::Run()
                 arg->pQueue = new TRingMQueue;
             }
             vecQueues[i] = arg->pQueue;
-            arg->pHandler = pHandler;
 
             pthread_t ioThread;
             pthread_create(&ioThread, NULL, RunIOThread, arg);
@@ -441,9 +573,8 @@ int TEpollSvr::Run()
             for(int j = 0; j < WORKER_NUM_PER_IO_THREAD; j++)
             {
                 WorkerThreadArg *arg = new WorkerThreadArg;
-                arg->pEpoller = ppEpoller[i];
+                arg->pEpollCtx = ppEpollCtx[i];
                 arg->pQueue = vecQueues[i];
-                arg->pHandler = pHandler;
 
                 pthread_t workerThread;
                 pthread_create(&workerThread, NULL, RunWorkerThread, arg);
@@ -457,13 +588,28 @@ int TEpollSvr::Run()
         for(int i = 0; i < IO_THREAD_NUM; i++)
         {
             MainThreadArg *arg = new MainThreadArg;
-            arg->pEpoller = ppEpoller[i];
+            arg->pEpollCtx = ppEpollCtx[i];
+            arg->pDataCache = pDataCache;
             pthread_t mainThread;
             pthread_create(&mainThread, NULL, RunMainThread, arg);
             pthread_detach(mainThread);
             printf("io and worker thread run\n");
         }
     }
+
+    //launch check timeout thread
+
+    struct TimeOutThreadArg * pTimeOutArg = new TimeOutThreadArg;
+    pTimeOutArg->ppEpollCtx = ppEpollCtx;
+    pTimeOutArg->pDataCache = pDataCache;
+
+    pthread_t timeoutThread;
+    pthread_attr_t timeout_attr;
+    pthread_attr_init(&timeout_attr);
+    pthread_attr_setstacksize(&timeout_attr, (size_t)2*1024*1024);
+    pthread_create( &timeoutThread, &timeout_attr, RunTimeOutThread, (void*)pTimeOutArg);
+    pthread_detach(timeoutThread);
+
 
     //launch accept thread
     AcptThreadArg *pAcptArg = new AcptThreadArg;
@@ -472,13 +618,15 @@ int TEpollSvr::Run()
     int iListenFd = TEpollUtils::Listen(NULL, LISTEN_PORT, 1024);
     if(iListenFd < 0)
     {
+        printf("listen err, errno %d %s\n", errno, strerror(errno));
         delete pAcptArg;
         pAcptArg = NULL;
         Stop();
         return -1;
     }
     pAcptArg->vecListenFd.push_back(iListenFd);
-    pAcptArg->ppEpoller = ppEpoller;
+    pAcptArg->ppEpollCtx = ppEpollCtx;
+    pAcptArg->pDataCache = pDataCache;
 
     pthread_attr_t attr;
     pthread_attr_init(&attr);
@@ -494,18 +642,19 @@ int TEpollSvr::Run()
 
     for(int i = 0; i < IO_THREAD_NUM; i++)
     {
-        delete ppEpoller[i];
-        ppEpoller[i] = NULL;
+        delete ppEpollCtx[i];
+        ppEpollCtx[i] = NULL;
     }
 
     delete pAcptArg;
     pAcptArg = NULL;
-    delete[] ppEpoller;
-    ppEpoller = NULL;
-    delete pHandler;
-    pHandler = NULL;
+
+    delete[] ppEpollCtx;
+    ppEpollCtx = NULL;
+
+    delete pDataCache;
     return 0;
-}
+    }
 
 int TEpollSvr::Stop()
 {
@@ -516,5 +665,8 @@ int TEpollSvr::Stop()
 int TEpollSvr::Init()
 {
     bIsMainRunning = true;
+    TEpollUtils::InitSignalHandler();
     return 0;
 }
+
+
