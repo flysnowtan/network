@@ -1,5 +1,4 @@
-#ifndef __T__MUTEXLOCK__H__
-#define __T__MUTEXLOCK__H__
+#pragma once
 
 #include <pthread.h>
 
@@ -42,5 +41,3 @@ public:
 private:
     TMutexLock * m_pLock;
 };
-
-#endif
