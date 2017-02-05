@@ -15,8 +15,7 @@
  *    3 - internal error, fork failed
  * 
  */ 
- 
- #include <sys/types.h>
+#include <sys/types.h>
 #include <sys/socket.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -79,7 +78,6 @@ static const struct option long_options[]=
     {"clients",required_argument,NULL,'c'},
     {NULL,0,NULL,0}
 };
-
 
 /* prototypes */
 static void benchcore(const char* host,const int port, const char *request);
@@ -163,7 +161,7 @@ int main(int argc, char *argv[])
             case 'c': clients=atoi(optarg);break;
         }
     }
-    
+
     if(optind==argc) {
         fprintf(stderr,"webbench: Missing URL!\n");
         usage();
@@ -179,7 +177,6 @@ int main(int argc, char *argv[])
     build_request(argv[optind]);
     /* print bench info */
     printf("\nBenchmarking: ");
-    
     switch(method)
     {
         case METHOD_GET:
@@ -282,8 +279,7 @@ void build_request(const char *url)
         // printf("ProxyHost=%s\nProxyPort=%d\n",proxyhost,proxyport);
         strcat(request,url);
     }
-    
-    if(http10==1)
+     if(http10==1)
         strcat(request," HTTP/1.0");
     else if (http10==2)
         strcat(request," HTTP/1.1");
@@ -412,7 +408,6 @@ static int bench(void)
     return i;
 }
 
-
 void benchcore(const char *host,const int port,const char *req)
 {
     int rlen;
@@ -446,12 +441,10 @@ nexttry:while(1)
                 if(shutdown(s,1)) { failed++;close(s);continue;}
             if(force==0)
             {
-                /* read all available data from socket */
                 while(1)
                 {
                     if(timerexpired) break;
                     i=read(s,buf,1500);
-                    /* fprintf(stderr,"%d\n",i); */
                     if(i<0)
                     {
                         failed++;
@@ -473,11 +466,10 @@ nexttry:while(1)
                     }
                 }
             }
-            if(close(s)) {failed++;continue;}
+            if(close(s)) {printf("close err\n"); failed++;continue;}
             speed++;
         }
 }
-
 
 int Socket(const char *host, int clientPort)
 {
