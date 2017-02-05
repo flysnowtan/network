@@ -1,0 +1,24 @@
+#pragma once
+
+//这些最好写到配置中
+#define LISTEN_PORT 9911
+#define IO_THREAD_NUM 8
+#define WORKER_NUM_PER_IO_THREAD 4
+#define EPOLL_WAIT_TIMEOUT 5
+
+
+#define MAX_ARRAY_SIZE 10000000
+#define RECV_BUFFER_LEN 1024*1024
+
+//ms
+#define INQUEUE_TIME_OUT 600 
+//s
+#define READ_TIME_OUT 20
+#define WRITE_TIME_OUT 20 
+#define TIME_OUT 20
+
+
+#define MAX_EPOLL_EVENTS 20480
+
+
+#define MAX_PKG_BUFFER_LEN 1024*1024
