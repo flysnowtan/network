@@ -1,5 +1,4 @@
-#ifndef __T__EPOLLUTILS__H__
-#define __T__EPOLLUTILS__H__
+#pragma once
 
 #include <stdint.h>
 
@@ -11,7 +10,7 @@ public:
     static void SigHandler(int sig);
     static int ForkAsDaemon();
     static int SetNonBlock(int iFd);
-};
 
-#endif
-      
+    static void DumpStack(std::string& info);
+
+};
